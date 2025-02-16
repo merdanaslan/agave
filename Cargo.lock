@@ -7116,6 +7116,7 @@ dependencies = [
  "bs58",
  "bytes",
  "chrono",
+ "criterion",
  "crossbeam-channel",
  "dashmap",
  "etcd-client",
