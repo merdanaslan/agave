@@ -6,7 +6,10 @@ use {
         distributions::uniform::{SampleUniform, UniformSampler},
         Rng,
     },
-    std::ops::{AddAssign, SubAssign},
+    std::{
+        borrow::Borrow,
+        ops::{AddAssign, SubAssign},
+    },
 };
 
 // Each internal tree node has FANOUT many child nodes with indices:
@@ -27,7 +30,6 @@ const BIT_MASK: usize = FANOUT - 1;
 ///     weight.
 ///   - Zero weighted indices are shuffled and appear only at the end, after
 ///     non-zero weighted indices.
-#[derive(Clone)]
 pub struct WeightedShuffle<T> {
     // Number of "internal" nodes of the tree.
     num_nodes: usize,
@@ -52,7 +54,12 @@ where
 {
     /// If weights are negative or overflow the total sum
     /// they are treated as zero.
-    pub fn new(name: &'static str, weights: &[T]) -> Self {
+    pub fn new<I>(name: &'static str, weights: I) -> Self
+    where
+        I: IntoIterator<Item: Borrow<T>>,
+        <I as IntoIterator>::IntoIter: ExactSizeIterator,
+    {
+        let weights = weights.into_iter();
         let (num_nodes, size) = get_num_nodes_and_tree_size(weights.len());
         debug_assert!(size <= num_nodes);
         let mut tree = vec![[Self::ZERO; FANOUT]; size];
@@ -60,7 +67,8 @@ where
         let mut zeros = Vec::default();
         let mut num_negative: usize = 0;
         let mut num_overflow: usize = 0;
-        for (k, &weight) in weights.iter().enumerate() {
+        for (k, weight) in weights.enumerate() {
+            let weight = *weight.borrow();
             #[allow(clippy::neg_cmp_op_on_partial_ord)]
             // weight < zero does not work for NaNs.
             if !(weight >= Self::ZERO) {
@@ -86,7 +94,14 @@ where
             while index != 0 {
                 let offset = (index - 1) & BIT_MASK;
                 index = (index - 1) >> BIT_SHIFT; // parent node
-                tree[index][offset] += weight;
+                debug_assert!(index < tree.len());
+                // SAFETY: Index is updated to a lesser value towards zero.
+                // The bitwise AND operation with BIT_MASK ensures that offset
+                // is always less than FANOUT, which is the size of the inner
+                // arrays. As a result, tree[index][offset] never goes out of
+                // bounds.
+                unsafe { tree.get_unchecked_mut(index).get_unchecked_mut(offset) }
+                    .add_assign(weight);
             }
         }
         if num_negative > 0 {
@@ -119,7 +134,12 @@ where
             let offset = (index - 1) & BIT_MASK;
             index = (index - 1) >> BIT_SHIFT; // parent node
             debug_assert!(self.tree[index][offset] >= weight);
-            self.tree[index][offset] -= weight;
+            // SAFETY: Index is updated to a lesser value towards zero. The
+            // bitwise AND operation with BIT_MASK ensures that offset is
+            // always less than FANOUT, which is the size of the inner arrays.
+            // As a result, tree[index][offset] never goes out of bounds.
+            unsafe { self.tree.get_unchecked_mut(index).get_unchecked_mut(offset) }
+                .sub_assign(weight);
         }
     }
 
@@ -128,23 +148,29 @@ where
     fn search(&self, mut val: T) -> (/*index:*/ usize, /*weight:*/ T) {
         debug_assert!(val >= Self::ZERO);
         debug_assert!(val < self.weight);
-        // Traverse the tree downwards from the root while maintaining the
-        // weight of the subtree which contains the target leaf node.
+        debug_assert!(!self.tree.is_empty());
+        // Traverse the tree downwards from the root to the target leaf node.
         let mut index = 0; // root
-        let mut weight = self.weight;
-        while let Some(tree) = self.tree.get(index) {
-            for (j, &node) in tree.iter().enumerate() {
-                if val < node {
-                    // Traverse to the j'th subtree of self.tree[index].
-                    weight = node;
-                    index = (index << BIT_SHIFT) + j + 1;
-                    break;
-                } else {
-                    val -= node;
-                }
+        loop {
+            // SAFETY: function returns if index goes out of bounds.
+            let (offset, &node) = unsafe { self.tree.get_unchecked(index) }
+                .iter()
+                .enumerate()
+                .find(|(_, &node)| {
+                    if val < node {
+                        true
+                    } else {
+                        val -= node;
+                        false
+                    }
+                })
+                .unwrap();
+            // Traverse to the subtree of self.tree[index].
+            index = (index << BIT_SHIFT) + offset + 1;
+            if self.tree.len() <= index {
+                return (index - self.num_nodes, node);
             }
         }
-        (index - self.num_nodes, weight)
     }
 
     pub fn remove_index(&mut self, k: usize) {
@@ -177,7 +203,7 @@ where
     pub fn first<R: Rng>(&self, rng: &mut R) -> Option<usize> {
         if self.weight > Self::ZERO {
             let sample = <T as SampleUniform>::Sampler::sample_single(Self::ZERO, self.weight, rng);
-            let (index, _weight) = WeightedShuffle::search(self, sample);
+            let (index, _) = self.search(sample);
             return Some(index);
         }
         if self.zeros.is_empty() {
@@ -188,16 +214,16 @@ where
     }
 }
 
-impl<'a, T: 'a> WeightedShuffle<T>
+impl<T> WeightedShuffle<T>
 where
     T: Copy + ConstZero + PartialOrd + SampleUniform + SubAssign,
 {
-    pub fn shuffle<R: Rng>(mut self, rng: &'a mut R) -> impl Iterator<Item = usize> + 'a {
+    pub fn shuffle<'a, R: Rng>(&'a mut self, rng: &'a mut R) -> impl Iterator<Item = usize> + 'a {
         std::iter::from_fn(move || {
             if self.weight > Self::ZERO {
                 let sample =
                     <T as SampleUniform>::Sampler::sample_single(Self::ZERO, self.weight, rng);
-                let (index, weight) = WeightedShuffle::search(&self, sample);
+                let (index, weight) = self.search(sample);
                 self.remove(index, weight);
                 return Some(index);
             }
@@ -223,6 +249,28 @@ fn get_num_nodes_and_tree_size(count: usize) -> (/*num_nodes:*/ usize, /*tree_si
         nodes *= FANOUT;
     }
     (size + nodes, size + count.div_ceil(FANOUT))
+}
+
+// #[derive(Clone)] does not overwrite clone_from which is used in
+// retransmit-stage to minimize allocations.
+impl<T: Clone> Clone for WeightedShuffle<T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            num_nodes: self.num_nodes,
+            tree: self.tree.clone(),
+            weight: self.weight.clone(),
+            zeros: self.zeros.clone(),
+        }
+    }
+
+    #[inline]
+    fn clone_from(&mut self, other: &Self) {
+        self.num_nodes = other.num_nodes;
+        self.tree.clone_from(&other.tree);
+        self.weight = other.weight.clone();
+        self.zeros.clone_from(&other.zeros);
+    }
 }
 
 #[cfg(test)]
@@ -330,7 +378,7 @@ mod tests {
     fn test_weighted_shuffle_empty_weights() {
         let weights = Vec::<u64>::new();
         let mut rng = rand::thread_rng();
-        let shuffle = WeightedShuffle::new("", &weights);
+        let shuffle = WeightedShuffle::new("", weights);
         assert!(shuffle.clone().shuffle(&mut rng).next().is_none());
         assert!(shuffle.first(&mut rng).is_none());
     }
@@ -341,7 +389,7 @@ mod tests {
         let weights = vec![0u64; 5];
         let seed = [37u8; 32];
         let mut rng = ChaChaRng::from_seed(seed);
-        let shuffle = WeightedShuffle::new("", &weights);
+        let shuffle = WeightedShuffle::new("", weights);
         assert_eq!(
             shuffle.clone().shuffle(&mut rng).collect::<Vec<_>>(),
             [1, 4, 2, 3, 0]
@@ -359,14 +407,15 @@ mod tests {
         let weights = [1, 0, 1000, 0, 0, 10, 100, 0];
         let mut counts = [0; 8];
         for _ in 0..100000 {
-            let mut shuffle = WeightedShuffle::new("", &weights).shuffle(&mut rng);
+            let mut weighted_shuffle = WeightedShuffle::new("", weights);
+            let mut shuffle = weighted_shuffle.shuffle(&mut rng);
             counts[shuffle.next().unwrap()] += 1;
             let _ = shuffle.count(); // consume the rest.
         }
         assert_eq!(counts, [95, 0, 90069, 0, 0, 908, 8928, 0]);
         let mut counts = [0; 8];
         for _ in 0..100000 {
-            let mut shuffle = WeightedShuffle::new("", &weights);
+            let mut shuffle = WeightedShuffle::new("", weights);
             shuffle.remove_index(5);
             shuffle.remove_index(3);
             shuffle.remove_index(1);
@@ -382,7 +431,7 @@ mod tests {
         const SEED: [u8; 32] = [48u8; 32];
         let weights = [19i64, 23, 7, 0, 0, 23, 3, 0, 5, 0, 19, 29];
         let mut rng = ChaChaRng::from_seed(SEED);
-        let shuffle = WeightedShuffle::new("", &weights);
+        let mut shuffle = WeightedShuffle::new("", weights);
         assert_eq!(
             shuffle.shuffle(&mut rng).collect::<Vec<_>>(),
             [8, 1, 5, 10, 11, 0, 2, 6, 9, 4, 3, 7]
@@ -390,7 +439,7 @@ mod tests {
         // Negative weights and overflowing ones are treated as zero.
         let weights = [19, 23, 7, -57, i64::MAX, 23, 3, i64::MAX, 5, -79, 19, 29];
         let mut rng = ChaChaRng::from_seed(SEED);
-        let shuffle = WeightedShuffle::new("", &weights);
+        let mut shuffle = WeightedShuffle::new("", weights);
         assert_eq!(
             shuffle.shuffle(&mut rng).collect::<Vec<_>>(),
             [8, 1, 5, 10, 11, 0, 2, 6, 9, 4, 3, 7]
@@ -404,7 +453,7 @@ mod tests {
         ];
         let seed = [48u8; 32];
         let mut rng = ChaChaRng::from_seed(seed);
-        let mut shuffle = WeightedShuffle::new("", &weights);
+        let mut shuffle = WeightedShuffle::new("", weights);
         assert_eq!(
             shuffle.clone().shuffle(&mut rng).collect::<Vec<_>>(),
             [2, 12, 18, 0, 14, 15, 17, 10, 1, 9, 7, 6, 13, 20, 4, 19, 3, 8, 11, 16, 5]
@@ -424,7 +473,7 @@ mod tests {
         assert_eq!(shuffle.first(&mut rng), Some(4));
         let seed = [37u8; 32];
         let mut rng = ChaChaRng::from_seed(seed);
-        let mut shuffle = WeightedShuffle::new("", &weights);
+        let mut shuffle = WeightedShuffle::new("", weights);
         assert_eq!(
             shuffle.clone().shuffle(&mut rng).collect::<Vec<_>>(),
             [19, 3, 15, 14, 6, 10, 17, 18, 9, 2, 4, 1, 0, 7, 8, 20, 12, 13, 16, 5, 11]
@@ -485,7 +534,7 @@ mod tests {
             weights.iter().fold(0u64, |a, &b| a.checked_add(b).unwrap()),
             weights.iter().sum::<u64>()
         );
-        let mut shuffle = WeightedShuffle::new("", &weights);
+        let mut shuffle = WeightedShuffle::<u64>::new("", &weights);
         let shuffle1 = shuffle.clone().shuffle(&mut rng).collect::<Vec<_>>();
         // Assert that all indices appear in the shuffle.
         assert_eq!(shuffle1.len(), num_weights);
@@ -526,13 +575,13 @@ mod tests {
             let mut seed = [0u8; 32];
             rng.fill(&mut seed[..]);
             let mut rng = ChaChaRng::from_seed(seed);
-            let shuffle = WeightedShuffle::new("", &weights);
+            let mut shuffle = WeightedShuffle::<u64>::new("", &weights);
             let shuffle: Vec<_> = shuffle.shuffle(&mut rng).collect();
             let mut rng = ChaChaRng::from_seed(seed);
             let shuffle_slow = weighted_shuffle_slow(&mut rng, weights.clone());
             assert_eq!(shuffle, shuffle_slow);
             let mut rng = ChaChaRng::from_seed(seed);
-            let shuffle = WeightedShuffle::new("", &weights);
+            let shuffle = WeightedShuffle::<u64>::new("", &weights);
             assert_eq!(shuffle.first(&mut rng), Some(shuffle_slow[0]));
         }
     }
@@ -545,7 +594,7 @@ mod tests {
             let seed = rng.gen::<[u8; 32]>();
             let mut rng = ChaChaRng::from_seed(seed);
             let shuffle_slow = weighted_shuffle_slow(&mut rng.clone(), weights.clone());
-            let shuffle = WeightedShuffle::new("", &weights);
+            let mut shuffle = WeightedShuffle::new("", weights);
             if size > 0 {
                 assert_eq!(shuffle.first(&mut rng.clone()), Some(shuffle_slow[0]));
             }

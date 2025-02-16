@@ -20,7 +20,10 @@ use {
     log::*,
     serde_derive::Serialize,
     solana_account_decoder::UiAccountEncoding,
-    solana_accounts_db::{accounts_db::CalcAccountsHashDataSource, accounts_index::ScanConfig},
+    solana_accounts_db::{
+        accounts_db::CalcAccountsHashDataSource,
+        accounts_index::{ScanConfig, ScanOrder},
+    },
     solana_clap_utils::{
         hidden_unless_forced,
         input_parsers::{cluster_type_of, pubkey_of, pubkeys_of},
@@ -51,6 +54,7 @@ use {
             Bank, RewardCalculationEvent,
         },
         bank_forks::BankForks,
+        inflation_rewards::points::{InflationPointCalculationEvent, PointValue},
         snapshot_archive_info::SnapshotArchiveInfoGetter,
         snapshot_bank_utils,
         snapshot_minimizer::SnapshotMinimizer,
@@ -76,7 +80,7 @@ use {
         system_program,
         transaction::{MessageHash, SimpleAddressLoader},
     },
-    solana_stake_program::{points::PointValue, stake_state},
+    solana_stake_program::stake_state,
     solana_transaction_status::parse_ui_instruction,
     solana_unified_scheduler_pool::DefaultSchedulerPool,
     solana_vote_program::{
@@ -2172,7 +2176,10 @@ fn main() {
 
                     if remove_stake_accounts {
                         for (address, mut account) in bank
-                            .get_program_accounts(&stake::program::id(), &ScanConfig::new(false))
+                            .get_program_accounts(
+                                &stake::program::id(),
+                                &ScanConfig::new(ScanOrder::Sorted),
+                            )
                             .unwrap()
                             .into_iter()
                         {
@@ -2196,7 +2203,10 @@ fn main() {
 
                     if !vote_accounts_to_destake.is_empty() {
                         for (address, mut account) in bank
-                            .get_program_accounts(&stake::program::id(), &ScanConfig::new(false))
+                            .get_program_accounts(
+                                &stake::program::id(),
+                                &ScanConfig::new(ScanOrder::Sorted),
+                            )
                             .unwrap()
                             .into_iter()
                         {
@@ -2236,7 +2246,7 @@ fn main() {
                         for (address, mut account) in bank
                             .get_program_accounts(
                                 &solana_vote_program::id(),
-                                &ScanConfig::new(false),
+                                &ScanConfig::new(ScanOrder::Sorted),
                             )
                             .unwrap()
                             .into_iter()
@@ -2751,7 +2761,6 @@ fn main() {
                             new_credits_observed: Option<u64>,
                             skipped_reasons: String,
                         }
-                        use solana_stake_program::points::InflationPointCalculationEvent;
                         let stake_calculation_details: DashMap<Pubkey, CalculationDetail> =
                             DashMap::new();
                         let last_point_value = Arc::new(RwLock::new(None));

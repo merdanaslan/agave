@@ -42,6 +42,7 @@ use {
         },
         bank_forks::BankForks,
         epoch_stakes::{split_epoch_stakes, EpochStakes, NodeVoteAccounts, VersionedEpochStakes},
+        inflation_rewards::points::InflationPointCalculationEvent,
         installed_scheduler_pool::{BankWithScheduler, InstalledSchedulerRwLock},
         rent_collector::RentCollectorWithMetrics,
         runtime_config::RuntimeConfig,
@@ -94,10 +95,8 @@ use {
     solana_compute_budget::compute_budget::ComputeBudget,
     solana_compute_budget_instruction::instructions_processor::process_compute_budget_instructions,
     solana_cost_model::{block_cost_limits::simd_0207_block_limits, cost_tracker::CostTracker},
-    solana_feature_set::{
-        self as feature_set, remove_rounding_in_fee_calculation, reward_full_priority_fee,
-        FeatureSet,
-    },
+    solana_feature_set::{self as feature_set, FeatureSet},
+    solana_fee::FeeFeatures,
     solana_lattice_hash::lt_hash::LtHash,
     solana_measure::{meas_dur, measure::Measure, measure_time, measure_us},
     solana_program_runtime::{
@@ -153,7 +152,6 @@ use {
         },
         transaction_context::{TransactionAccount, TransactionReturnData},
     },
-    solana_stake_program::points::InflationPointCalculationEvent,
     solana_svm::{
         account_loader::{collect_rent_from_account, LoadedTransaction},
         account_overrides::AccountOverrides,
@@ -201,10 +199,10 @@ use {
     solana_accounts_db::accounts_db::{
         ACCOUNTS_DB_CONFIG_FOR_BENCHMARKS, ACCOUNTS_DB_CONFIG_FOR_TESTING,
     },
+    solana_nonce_account::{get_system_account_kind, SystemAccountKind},
     solana_program_runtime::{loaded_programs::ProgramCacheForTxBatch, sysvar_cache::SysvarCache},
     solana_sdk::nonce,
     solana_svm::program_loader::load_program_with_pubkey,
-    solana_system_program::{get_system_account_kind, SystemAccountKind},
 };
 
 /// params to `verify_accounts_hash`
@@ -2548,14 +2546,19 @@ impl Bank {
     /// recalcuates the bank hash.
     ///
     /// Note that the account state is *not* allowed to change by rehashing.
-    /// If it does, this function will panic.
     /// If modifying accounts in ledger-tool is needed, create a new bank.
     pub fn rehash(&self) {
         let get_delta_hash = || {
-            self.rc
-                .accounts
-                .accounts_db
-                .get_accounts_delta_hash(self.slot())
+            (!self
+                .feature_set
+                .is_active(&feature_set::remove_accounts_delta_hash::id()))
+            .then(|| {
+                self.rc
+                    .accounts
+                    .accounts_db
+                    .get_accounts_delta_hash(self.slot())
+            })
+            .flatten()
         };
 
         let mut hash = self.hash.write().unwrap();
@@ -2590,11 +2593,7 @@ impl Bank {
         if *hash == Hash::default() {
             // finish up any deferred changes to account state
             self.collect_rent_eagerly();
-            if self.feature_set.is_active(&reward_full_priority_fee::id()) {
-                self.distribute_transaction_fee_details();
-            } else {
-                self.distribute_transaction_fees();
-            }
+            self.distribute_transaction_fee_details();
             self.distribute_rent_fees();
             self.update_slot_history();
             self.run_incinerator();
@@ -2919,8 +2918,7 @@ impl Bank {
             lamports_per_signature == 0,
             self.fee_structure().lamports_per_signature,
             fee_budget_limits.prioritization_fee,
-            self.feature_set
-                .is_active(&remove_rounding_in_fee_calculation::id()),
+            FeeFeatures::from(self.feature_set.as_ref()),
         )
     }
 
@@ -3613,21 +3611,6 @@ impl Bank {
         self.update_accounts_data_size_delta_off_chain(data_size_delta);
     }
 
-    fn filter_program_errors_and_collect_fee(
-        &self,
-        processing_results: &[TransactionProcessingResult],
-    ) {
-        let mut fees = 0;
-
-        processing_results.iter().for_each(|processing_result| {
-            if let Ok(processed_tx) = processing_result {
-                fees += processed_tx.fee_details().total_fee();
-            }
-        });
-
-        self.collector_fees.fetch_add(fees, Relaxed);
-    }
-
     // Note: this function is not yet used; next PR will call it behind a feature gate
     fn filter_program_errors_and_collect_fee_details(
         &self,
@@ -3763,11 +3746,7 @@ impl Bank {
         let ((), update_transaction_statuses_us) =
             measure_us!(self.update_transaction_statuses(sanitized_txs, &processing_results));
 
-        if self.feature_set.is_active(&reward_full_priority_fee::id()) {
-            self.filter_program_errors_and_collect_fee_details(&processing_results)
-        } else {
-            self.filter_program_errors_and_collect_fee(&processing_results)
-        };
+        self.filter_program_errors_and_collect_fee_details(&processing_results);
 
         timings.saturating_add_in_place(ExecuteTimingType::StoreUs, store_accounts_us);
         timings.saturating_add_in_place(
@@ -4866,6 +4845,14 @@ impl Bank {
             );
         }
 
+        // If the accounts delta hash is still in use, start the background account hasher
+        if !self
+            .feature_set
+            .is_active(&feature_set::remove_accounts_delta_hash::id())
+        {
+            self.rc.accounts.accounts_db.start_background_hasher();
+        }
+
         if !debug_do_not_add_builtins {
             for builtin in BUILTINS
                 .iter()
@@ -5223,25 +5210,38 @@ impl Bank {
     ///  of the delta of the ledger since the last vote and up to now
     fn hash_internal_state(&self) -> Hash {
         let measure_total = Measure::start("");
-
         let slot = self.slot();
-        let (accounts_delta_hash, accounts_delta_hash_us) = measure_us!({
-            self.rc
-                .accounts
-                .accounts_db
-                .calculate_accounts_delta_hash_internal(
-                    slot,
-                    None,
-                    self.skipped_rewrites.lock().unwrap().clone(),
-                )
+
+        let delta_hash_info = (!self
+            .feature_set
+            .is_active(&feature_set::remove_accounts_delta_hash::id()))
+        .then(|| {
+            measure_us!({
+                self.rc
+                    .accounts
+                    .accounts_db
+                    .calculate_accounts_delta_hash_internal(
+                        slot,
+                        None,
+                        self.skipped_rewrites.lock().unwrap().clone(),
+                    )
+            })
         });
 
-        let mut hash = hashv(&[
-            self.parent_hash.as_ref(),
-            accounts_delta_hash.0.as_ref(),
-            &self.signature_count().to_le_bytes(),
-            self.last_blockhash().as_ref(),
-        ]);
+        let mut hash = if let Some((accounts_delta_hash, _measure)) = delta_hash_info.as_ref() {
+            hashv(&[
+                self.parent_hash.as_ref(),
+                accounts_delta_hash.0.as_ref(),
+                &self.signature_count().to_le_bytes(),
+                self.last_blockhash().as_ref(),
+            ])
+        } else {
+            hashv(&[
+                self.parent_hash.as_ref(),
+                &self.signature_count().to_le_bytes(),
+                self.last_blockhash().as_ref(),
+            ])
+        };
 
         let accounts_hash_info = if self
             .feature_set
@@ -5297,21 +5297,29 @@ impl Bank {
         let bank_hash_stats = self.bank_hash_stats.load();
 
         let total_us = measure_total.end_as_us();
+
+        let (accounts_delta_hash_us, accounts_delta_hash_log) = delta_hash_info
+            .map(|(hash, us)| (us, format!(" accounts_delta: {}", hash.0)))
+            .unzip();
         datapoint_info!(
             "bank-hash_internal_state",
             ("slot", slot, i64),
             ("total_us", total_us, i64),
-            ("accounts_delta_hash_us", accounts_delta_hash_us, i64),
+            ("accounts_delta_hash_us", accounts_delta_hash_us, Option<i64>),
         );
         info!(
-            "bank frozen: {slot} hash: {hash} accounts_delta: {} signature_count: {} last_blockhash: {} capitalization: {}{}, stats: {bank_hash_stats:?}",
-            accounts_delta_hash.0,
+            "bank frozen: {slot} hash: {hash}{} signature_count: {} last_blockhash: {} capitalization: {}{}, stats: {bank_hash_stats:?}",
+            accounts_delta_hash_log.unwrap_or_default(),
             self.signature_count(),
             self.last_blockhash(),
             self.capitalization(),
             accounts_hash_info.unwrap_or_default(),
         );
         hash
+    }
+
+    pub fn collector_fees(&self) -> u64 {
+        self.collector_fees.load(Relaxed)
     }
 
     /// The epoch accounts hash is hashed into the bank's hash once per epoch at a predefined slot.
@@ -6517,6 +6525,12 @@ impl Bank {
                 vote_cost_limit,
             );
         }
+
+        if new_feature_activations.contains(&feature_set::remove_accounts_delta_hash::id()) {
+            // If the accounts delta hash has been removed, then we no longer need to compute the
+            // AccountHash for modified accounts, and can stop the background account hasher.
+            self.rc.accounts.accounts_db.stop_background_hasher();
+        }
     }
 
     fn apply_updated_hashes_per_tick(&mut self, hashes_per_tick: u64) {
@@ -6880,6 +6894,22 @@ impl TransactionProcessingCallback for Bank {
             .get(vote_address)
             .map(|(stake, _)| (*stake))
             .unwrap_or(0)
+    }
+
+    fn calculate_fee(
+        &self,
+        message: &impl SVMMessage,
+        lamports_per_signature: u64,
+        prioritization_fee: u64,
+        feature_set: &FeatureSet,
+    ) -> FeeDetails {
+        solana_fee::calculate_fee_details(
+            message,
+            false, /* zero_fees_for_test */
+            lamports_per_signature,
+            prioritization_fee,
+            FeeFeatures::from(feature_set),
+        )
     }
 }
 

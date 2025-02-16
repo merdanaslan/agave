@@ -11,6 +11,10 @@ use {
             PrevEpochInflationRewards, RewardCalcTracer, RewardCalculationEvent, RewardsMetrics,
             VoteAccount, VoteReward, VoteRewards,
         },
+        inflation_rewards::{
+            points::{calculate_points, PointValue},
+            redeem_rewards,
+        },
         stake_account::StakeAccount,
         stakes::Stakes,
     },
@@ -31,7 +35,6 @@ use {
         stake::state::{Delegation, StakeStateV2},
         sysvar::epoch_rewards::EpochRewards,
     },
-    solana_stake_program::points::PointValue,
     std::sync::atomic::{AtomicU64, Ordering::Relaxed},
 };
 
@@ -238,11 +241,12 @@ impl Bank {
             .parent()
             .expect("Partitioned rewards calculation must still have access to parent Bank.")
             .last_blockhash();
-        let stake_rewards_by_partition = hash_rewards_into_partitions(
+        let (stake_rewards_by_partition, hash_us) = measure_us!(hash_rewards_into_partitions(
             std::mem::take(&mut stake_rewards.stake_rewards),
             &parent_blockhash,
             num_partitions as usize,
-        );
+        ));
+        metrics.hash_partition_rewards_us += hash_us;
 
         PartitionedRewardsCalculation {
             vote_account_rewards,
@@ -345,6 +349,7 @@ impl Bank {
             // already have been cached in cached_vote_accounts; so the code
             // below is only for sanity checking, and can be removed once
             // the cache is deemed to be reliable.
+            metrics.vote_accounts_cache_miss_count.fetch_add(1, Relaxed);
             let account = self.get_account_with_fixed_root(vote_pubkey)?;
             VoteAccount::try_from(account).ok()
         };
@@ -378,7 +383,7 @@ impl Bank {
 
                     let pre_lamport = stake_account.lamports();
 
-                    let redeemed = solana_stake_program::rewards::redeem_rewards(
+                    let redeemed = redeem_rewards(
                         rewarded_epoch,
                         stake_state,
                         &mut stake_account,
@@ -434,7 +439,7 @@ impl Bank {
                         });
                     } else {
                         debug!(
-                            "solana_stake_program::rewards::redeem_rewards() failed for {}: {:?}",
+                            "redeem_rewards() failed for {}: {:?}",
                             stake_pubkey, redeemed
                         );
                     }
@@ -499,7 +504,7 @@ impl Bank {
                         return 0;
                     }
 
-                    solana_stake_program::points::calculate_points(
+                    calculate_points(
                         stake_account.stake_state(),
                         vote_account.vote_state(),
                         stake_history,

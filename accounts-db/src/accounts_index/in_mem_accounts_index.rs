@@ -10,8 +10,9 @@ use {
     },
     rand::{thread_rng, Rng},
     solana_bucket_map::bucket_api::BucketApi,
+    solana_clock::Slot,
     solana_measure::measure::Measure,
-    solana_sdk::{clock::Slot, pubkey::Pubkey},
+    solana_pubkey::Pubkey,
     std::{
         collections::{hash_map::Entry, HashMap, HashSet},
         fmt::Debug,

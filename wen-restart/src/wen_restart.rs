@@ -34,7 +34,7 @@ use {
     },
     solana_pubkey::Pubkey,
     solana_runtime::{
-        accounts_background_service::AbsRequestSender,
+        accounts_background_service::{AbsRequestSender, AbsStatus},
         bank::Bank,
         bank_forks::BankForks,
         snapshot_archive_info::SnapshotArchiveInfoGetter,
@@ -50,7 +50,7 @@ use {
     solana_shred_version::compute_shred_version,
     solana_time_utils::timestamp,
     solana_timings::ExecuteTimings,
-    solana_vote_program::vote_state::VoteTransaction,
+    solana_vote::vote_transaction::VoteTransaction,
     std::{
         collections::{HashMap, HashSet},
         fs::{read, File},
@@ -431,7 +431,6 @@ pub(crate) fn find_heaviest_fork(
         slots,
         blockstore.clone(),
         bank_forks.clone(),
-        root_bank,
         &exit,
     )?;
     info!(
@@ -475,6 +474,7 @@ pub(crate) fn generate_snapshot(
     bank_forks: Arc<RwLock<BankForks>>,
     snapshot_config: &SnapshotConfig,
     accounts_background_request_sender: &AbsRequestSender,
+    abs_status: &AbsStatus,
     genesis_config_hash: Hash,
     my_heaviest_fork_slot: Slot,
 ) -> Result<GenerateSnapshotRecord> {
@@ -507,11 +507,34 @@ pub(crate) fn generate_snapshot(
             accounts_background_request_sender,
         )?;
     }
+
     // There can't be more than one EAH calculation in progress. If new_root is generated
     // within the EAH window (1/4 epoch to 3/4 epoch), the following function will wait for
     // EAH calculation to finish. So if we trigger another EAH when generating snapshots
     // we won't hit a panic.
     let _ = new_root_bank.get_epoch_accounts_hash_to_serialize();
+
+    // Snapshot generation calls AccountsDb background tasks (flush/clean/shrink).
+    // These cannot run conncurrent with each other, so we must shutdown
+    // AccountsBackgroundService before proceeding.
+    abs_status.stop();
+    info!("Waiting for AccountsBackgroundService to stop");
+    while abs_status.is_running() {
+        std::thread::yield_now();
+    }
+    // Similar to waiting for ABS to stop, we also wait for the initial startup
+    // verification to complete.  The startup verification runs in the background
+    // and verifies the snapshot's accounts are correct.  We only want a
+    // single accounts hash calculation to run at a time, and since snapshot
+    // creation below will calculate the accounts hash, we wait for the startup
+    // verification to complete before proceeding.
+    new_root_bank
+        .rc
+        .accounts
+        .accounts_db
+        .verify_accounts_hash_in_bg
+        .join_background_thread();
+
     let mut directory = &snapshot_config.full_snapshot_archives_dir;
     // Calculate the full_snapshot_slot an incremental snapshot should depend on. If the
     // validator is configured not the generate snapshot, it will only have the initial
@@ -593,7 +616,6 @@ pub(crate) fn find_bankhash_of_heaviest_fork(
     slots: Vec<Slot>,
     blockstore: Arc<Blockstore>,
     bank_forks: Arc<RwLock<BankForks>>,
-    root_bank: Arc<Bank>,
     exit: &AtomicBool,
 ) -> Result<Hash> {
     if let Some(hash) = bank_forks
@@ -604,6 +626,7 @@ pub(crate) fn find_bankhash_of_heaviest_fork(
     {
         return Ok(hash);
     }
+    let root_bank = bank_forks.read().unwrap().root_bank();
     let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
     let replay_tx_thread_pool = rayon::ThreadPoolBuilder::new()
         .thread_name(|i| format!("solReplayTx{i:02}"))
@@ -618,59 +641,47 @@ pub(crate) fn find_bankhash_of_heaviest_fork(
         if exit.load(Ordering::Relaxed) {
             return Err(WenRestartError::Exiting.into());
         }
-        let saved_bank;
-        {
-            saved_bank = bank_forks.read().unwrap().get(slot);
-        }
-        let bank = match saved_bank {
-            Some(cur_bank) => {
-                if !cur_bank.is_frozen() {
-                    return Err(WenRestartError::BlockNotFrozenAfterReplay(slot, None).into());
-                }
-                cur_bank
-            }
-            None => {
-                let new_bank = Bank::new_from_parent(
-                    parent_bank.clone(),
-                    &leader_schedule_cache
-                        .slot_leader_at(slot, Some(&parent_bank))
-                        .unwrap(),
-                    slot,
+        let saved_bank = bank_forks.read().unwrap().get_with_scheduler(slot);
+        let bank_with_scheduler = saved_bank.unwrap_or_else(|| {
+            let new_bank = Bank::new_from_parent(
+                parent_bank.clone(),
+                &leader_schedule_cache
+                    .slot_leader_at(slot, Some(&parent_bank))
+                    .unwrap(),
+                slot,
+            );
+            bank_forks.write().unwrap().insert_from_ledger(new_bank)
+        });
+        let bank = if bank_with_scheduler.is_frozen() {
+            bank_with_scheduler.clone_without_scheduler()
+        } else {
+            let mut progress = ConfirmationProgress::new(parent_bank.last_blockhash());
+            if let Err(e) = process_single_slot(
+                &blockstore,
+                &bank_with_scheduler,
+                &replay_tx_thread_pool,
+                &opts,
+                &recyclers,
+                &mut progress,
+                None,
+                None,
+                None,
+                None,
+                &mut timing,
+            ) {
+                return Err(
+                    WenRestartError::BlockNotFrozenAfterReplay(slot, Some(e.to_string())).into(),
                 );
-                let bank_with_scheduler;
-                {
-                    bank_with_scheduler = bank_forks.write().unwrap().insert_from_ledger(new_bank);
-                }
-                let mut progress = ConfirmationProgress::new(parent_bank.last_blockhash());
-                if let Err(e) = process_single_slot(
-                    &blockstore,
-                    &bank_with_scheduler,
-                    &replay_tx_thread_pool,
-                    &opts,
-                    &recyclers,
-                    &mut progress,
-                    None,
-                    None,
-                    None,
-                    None,
-                    &mut timing,
-                ) {
-                    return Err(WenRestartError::BlockNotFrozenAfterReplay(
-                        slot,
-                        Some(e.to_string()),
-                    )
-                    .into());
-                }
-                let cur_bank;
-                {
-                    cur_bank = bank_forks
-                        .read()
-                        .unwrap()
-                        .get(slot)
-                        .expect("bank should have been just inserted");
-                }
-                cur_bank
             }
+            let cur_bank;
+            {
+                cur_bank = bank_forks
+                    .read()
+                    .unwrap()
+                    .get(slot)
+                    .expect("bank should have been just inserted");
+            }
+            cur_bank
         };
         parent_bank = bank;
     }
@@ -837,11 +848,7 @@ pub(crate) fn verify_coordinator_heaviest_fork(
         blockstore.clone(),
         wen_restart_repair_slots.clone(),
     )?;
-    let root_bank;
-    {
-        root_bank = bank_forks.read().unwrap().root_bank();
-    }
-    let root_slot = root_bank.slot();
+    let root_slot = bank_forks.read().unwrap().root_bank().slot();
     let mut coordinator_heaviest_slot_ancestors: Vec<Slot> =
         AncestorIterator::new_inclusive(coordinator_heaviest_slot, &blockstore)
             .take_while(|slot| slot >= &root_slot)
@@ -879,7 +886,6 @@ pub(crate) fn verify_coordinator_heaviest_fork(
             coordinator_heaviest_slot_ancestors,
             blockstore.clone(),
             bank_forks.clone(),
-            root_bank,
             &exit,
         )?
     } else {
@@ -991,6 +997,7 @@ pub struct WenRestartConfig {
     pub wait_for_supermajority_threshold_percent: u64,
     pub snapshot_config: SnapshotConfig,
     pub accounts_background_request_sender: AbsRequestSender,
+    pub abs_status: AbsStatus,
     pub genesis_config_hash: Hash,
     pub exit: Arc<AtomicBool>,
 }
@@ -1102,6 +1109,7 @@ pub fn wait_for_wen_restart(config: WenRestartConfig) -> Result<()> {
                         config.bank_forks.clone(),
                         &config.snapshot_config,
                         &config.accounts_background_request_sender,
+                        &config.abs_status,
                         config.genesis_config_hash,
                         my_heaviest_fork_slot,
                     )?,
@@ -1704,6 +1712,7 @@ mod tests {
             wait_for_supermajority_threshold_percent: 80,
             snapshot_config: SnapshotConfig::default(),
             accounts_background_request_sender: AbsRequestSender::default(),
+            abs_status: AbsStatus::new_for_tests(),
             genesis_config_hash: test_state.genesis_config_hash,
             exit: exit.clone(),
         };
@@ -1775,6 +1784,7 @@ mod tests {
             wait_for_supermajority_threshold_percent: 80,
             snapshot_config,
             accounts_background_request_sender: AbsRequestSender::default(),
+            abs_status: AbsStatus::new_for_tests(),
             genesis_config_hash: test_state.genesis_config_hash,
             exit: exit.clone(),
         };
@@ -2129,6 +2139,7 @@ mod tests {
                 wait_for_supermajority_threshold_percent: 80,
                 snapshot_config: SnapshotConfig::default(),
                 accounts_background_request_sender: AbsRequestSender::default(),
+                abs_status: AbsStatus::new_for_tests(),
                 genesis_config_hash: test_state.genesis_config_hash,
                 exit: Arc::new(AtomicBool::new(false)),
             })
@@ -3242,7 +3253,6 @@ mod tests {
             slots,
             test_state.blockstore.clone(),
             test_state.bank_forks.clone(),
-            old_root_bank,
             &exit,
         )
         .unwrap();
@@ -3257,6 +3267,7 @@ mod tests {
             test_state.bank_forks.clone(),
             &snapshot_config,
             &AbsRequestSender::default(),
+            &AbsStatus::new_for_tests(),
             test_state.genesis_config_hash,
             old_root_slot,
         )
@@ -3272,6 +3283,7 @@ mod tests {
             test_state.bank_forks.clone(),
             &snapshot_config,
             &AbsRequestSender::default(),
+            &AbsStatus::new_for_tests(),
             test_state.genesis_config_hash,
             new_root_slot,
         )
@@ -3321,6 +3333,7 @@ mod tests {
                 test_state.bank_forks.clone(),
                 &snapshot_config,
                 &AbsRequestSender::default(),
+                &AbsStatus::new_for_tests(),
                 test_state.genesis_config_hash,
                 old_root_slot,
             )
@@ -3342,6 +3355,7 @@ mod tests {
                 test_state.bank_forks.clone(),
                 &snapshot_config,
                 &AbsRequestSender::default(),
+                &AbsStatus::new_for_tests(),
                 test_state.genesis_config_hash,
                 older_slot,
             )
@@ -3364,6 +3378,7 @@ mod tests {
                 test_state.bank_forks.clone(),
                 &snapshot_config,
                 &AbsRequestSender::default(),
+                &AbsStatus::new_for_tests(),
                 test_state.genesis_config_hash,
                 empty_slot,
             )
@@ -3386,6 +3401,7 @@ mod tests {
             test_state.bank_forks.clone(),
             &snapshot_config,
             &AbsRequestSender::default(),
+            &AbsStatus::new_for_tests(),
             test_state.genesis_config_hash,
             test_state.last_voted_fork_slots[0],
         )
@@ -3416,6 +3432,7 @@ mod tests {
             wait_for_supermajority_threshold_percent: 80,
             snapshot_config: SnapshotConfig::default(),
             accounts_background_request_sender: AbsRequestSender::default(),
+            abs_status: AbsStatus::new_for_tests(),
             genesis_config_hash: test_state.genesis_config_hash,
             exit: Arc::new(AtomicBool::new(false)),
         };
@@ -3636,7 +3653,6 @@ mod tests {
         let mut pushed_hash = Hash::default();
         // The coordinator always sends its own choice.
         let coordinator_slot = last_vote;
-        let old_root_bank = test_state.bank_forks.read().unwrap().root_bank();
         let mut slots = test_state.last_voted_fork_slots.clone();
         slots.reverse();
         let coordinator_hash = find_bankhash_of_heaviest_fork(
@@ -3644,7 +3660,6 @@ mod tests {
             slots,
             test_state.blockstore.clone(),
             test_state.bank_forks.clone(),
-            old_root_bank,
             &exit,
         )
         .unwrap();
@@ -3664,6 +3679,7 @@ mod tests {
             wait_for_supermajority_threshold_percent: 80,
             snapshot_config: SnapshotConfig::default(),
             accounts_background_request_sender: AbsRequestSender::default(),
+            abs_status: AbsStatus::new_for_tests(),
             genesis_config_hash: test_state.genesis_config_hash,
             exit: exit.clone(),
         };
@@ -3751,5 +3767,73 @@ mod tests {
         );
         assert_eq!(pushed_slot, my_slot);
         assert_eq!(pushed_hash, my_hash);
+    }
+
+    fn run_and_check_find_bankhash_of_heaviest_fork(
+        test_state: &WenRestartTestInitResult,
+        slots: &[Slot],
+        slot: Slot,
+    ) {
+        let exit = Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            find_bankhash_of_heaviest_fork(
+                slot,
+                slots.to_vec(),
+                test_state.blockstore.clone(),
+                test_state.bank_forks.clone(),
+                &exit,
+            )
+            .unwrap(),
+            test_state
+                .bank_forks
+                .read()
+                .unwrap()
+                .get(slot)
+                .unwrap()
+                .hash()
+        );
+    }
+
+    #[test]
+    fn test_find_bankhash_of_heaviest_fork() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let test_state = wen_restart_test_init(&ledger_path);
+        let last_vote = test_state.last_voted_fork_slots[0];
+        let mut slots = test_state.last_voted_fork_slots.clone();
+        slots.reverse();
+        run_and_check_find_bankhash_of_heaviest_fork(&test_state, &slots, last_vote);
+        let new_slot = last_vote + 1;
+        let _ = insert_slots_into_blockstore(
+            test_state.blockstore.clone(),
+            last_vote,
+            &[new_slot],
+            TICKS_PER_SLOT,
+            test_state.last_blockhash,
+        );
+        slots.push(new_slot);
+        run_and_check_find_bankhash_of_heaviest_fork(&test_state, &slots, new_slot);
+        let slot_full_but_not_replayed = last_vote + 2;
+        let _ = insert_slots_into_blockstore(
+            test_state.blockstore.clone(),
+            last_vote,
+            &[slot_full_but_not_replayed],
+            TICKS_PER_SLOT,
+            test_state.last_blockhash,
+        );
+        let new_bank = Bank::new_from_parent(
+            test_state.bank_forks.read().unwrap().get(new_slot).unwrap(),
+            &Pubkey::default(),
+            slot_full_but_not_replayed,
+        );
+        let _ = test_state
+            .bank_forks
+            .write()
+            .unwrap()
+            .insert_from_ledger(new_bank);
+        run_and_check_find_bankhash_of_heaviest_fork(
+            &test_state,
+            &slots,
+            slot_full_but_not_replayed,
+        );
     }
 }

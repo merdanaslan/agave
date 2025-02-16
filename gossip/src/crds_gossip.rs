@@ -11,7 +11,9 @@ use {
         crds::{Crds, GossipRoute},
         crds_data::CrdsData,
         crds_gossip_error::CrdsGossipError,
-        crds_gossip_pull::{CrdsFilter, CrdsGossipPull, CrdsTimeouts, ProcessPullStats},
+        crds_gossip_pull::{
+            CrdsFilter, CrdsGossipPull, CrdsTimeouts, ProcessPullStats, PullRequest,
+        },
         crds_gossip_push::CrdsGossipPush,
         crds_value::CrdsValue,
         duplicate_shred::{self, DuplicateShredIndex, MAX_DUPLICATE_SHREDS},
@@ -74,12 +76,15 @@ impl CrdsGossip {
         pubkey: &Pubkey, // This node.
         now: u64,
         stakes: &HashMap<Pubkey, u64>,
+        should_retain_crds_value: impl Fn(&CrdsValue) -> bool,
     ) -> (
-        HashMap<Pubkey, Vec<CrdsValue>>,
-        usize, // number of values
+        Vec<CrdsValue>, // unique CrdsValues pushed out to peers
+        // map of pubkeys to indices in Vec<CrdsValue> pushed to that peer
+        HashMap<Pubkey, Vec</*index:*/ usize>>,
         usize, // number of push messages
     ) {
-        self.push.new_push_messages(pubkey, &self.crds, now, stakes)
+        self.push
+            .new_push_messages(pubkey, &self.crds, now, stakes, should_retain_crds_value)
     }
 
     pub(crate) fn push_duplicate_shred<F>(
@@ -209,7 +214,7 @@ impl CrdsGossip {
         ping_cache: &Mutex<PingCache>,
         pings: &mut Vec<(SocketAddr, Ping)>,
         socket_addr_space: &SocketAddrSpace,
-    ) -> Result<Vec<(ContactInfo, Vec<CrdsFilter>)>, CrdsGossipError> {
+    ) -> Result<impl Iterator<Item = (SocketAddr, CrdsFilter)> + Clone, CrdsGossipError> {
         self.pull.new_pull_request(
             thread_pool,
             &self.crds,
@@ -228,17 +233,19 @@ impl CrdsGossip {
     pub fn generate_pull_responses(
         &self,
         thread_pool: &ThreadPool,
-        filters: &[(CrdsValue, CrdsFilter)],
+        requests: &[PullRequest],
         output_size_limit: usize, // Limit number of crds values returned.
         now: u64,
+        should_retain_crds_value: impl Fn(&CrdsValue) -> bool + Sync,
         stats: &GossipStats,
     ) -> Vec<Vec<CrdsValue>> {
         CrdsGossipPull::generate_pull_responses(
             thread_pool,
             &self.crds,
-            filters,
+            requests,
             output_size_limit,
             now,
+            should_retain_crds_value,
             stats,
         )
     }

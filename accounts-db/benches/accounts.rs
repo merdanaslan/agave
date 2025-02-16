@@ -7,6 +7,7 @@ use {
     dashmap::DashMap,
     rand::Rng,
     rayon::iter::{IntoParallelRefIterator, ParallelIterator},
+    solana_account::{Account, AccountSharedData, ReadableAccount},
     solana_accounts_db::{
         account_info::{AccountInfo, StorageLocation},
         accounts::{AccountAddressFilter, Accounts},
@@ -17,13 +18,10 @@ use {
         accounts_index::ScanConfig,
         ancestors::Ancestors,
     },
-    solana_sdk::{
-        account::{Account, AccountSharedData, ReadableAccount},
-        hash::Hash,
-        pubkey::Pubkey,
-        rent_collector::RentCollector,
-        sysvar::epoch_schedule::EpochSchedule,
-    },
+    solana_hash::Hash,
+    solana_pubkey::Pubkey,
+    solana_rent_collector::RentCollector,
+    solana_sysvar::epoch_schedule::EpochSchedule,
     std::{
         collections::{HashMap, HashSet},
         path::PathBuf,

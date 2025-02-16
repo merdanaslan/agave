@@ -1,8 +1,9 @@
 use {
     super::{
         in_flight_tracker::InFlightTracker,
+        scheduler::Scheduler,
         scheduler_error::SchedulerError,
-        thread_aware_account_locks::{ThreadAwareAccountLocks, ThreadId, ThreadSet},
+        thread_aware_account_locks::{ThreadAwareAccountLocks, ThreadId, ThreadSet, TryLockError},
         transaction_state::SanitizedTransactionTTL,
     },
     crate::banking_stage::{
@@ -12,8 +13,8 @@ use {
             ConsumeWork, FinishedConsumeWork, MaxAge, TransactionBatchId, TransactionId,
         },
         transaction_scheduler::{
-            transaction_priority_id::TransactionPriorityId, transaction_state::TransactionState,
-            transaction_state_container::StateContainer,
+            scheduler::SchedulingSummary, transaction_priority_id::TransactionPriorityId,
+            transaction_state::TransactionState, transaction_state_container::StateContainer,
         },
     },
     crossbeam_channel::{Receiver, Sender, TryRecvError},
@@ -43,7 +44,7 @@ type SchedulerPrioGraph = PrioGraph<
 
 pub(crate) struct PrioGraphSchedulerConfig {
     pub max_scheduled_cus: u64,
-    pub max_transactions_per_scheduling_pass: usize,
+    pub max_scanned_transactions_per_scheduling_pass: usize,
     pub look_ahead_window_size: usize,
     pub target_transactions_per_batch: usize,
 }
@@ -52,8 +53,8 @@ impl Default for PrioGraphSchedulerConfig {
     fn default() -> Self {
         Self {
             max_scheduled_cus: MAX_BLOCK_UNITS,
-            max_transactions_per_scheduling_pass: 100_000,
-            look_ahead_window_size: 2048,
+            max_scanned_transactions_per_scheduling_pass: 1000,
+            look_ahead_window_size: 256,
             target_transactions_per_batch: TARGET_NUM_TRANSACTIONS_PER_BATCH,
         }
     }
@@ -84,7 +85,9 @@ impl<Tx: TransactionWithMeta> PrioGraphScheduler<Tx> {
             config,
         }
     }
+}
 
+impl<Tx: TransactionWithMeta> Scheduler<Tx> for PrioGraphScheduler<Tx> {
     /// Schedule transactions from the given `StateContainer` to be
     /// consumed by the worker threads. Returns summary of scheduling, or an
     /// error.
@@ -101,7 +104,7 @@ impl<Tx: TransactionWithMeta> PrioGraphScheduler<Tx> {
     /// This, combined with internal tracking of threads' in-flight transactions, allows
     /// for load-balancing while prioritizing scheduling transactions onto threads that will
     /// not cause conflicts in the near future.
-    pub(crate) fn schedule<S: StateContainer<Tx>>(
+    fn schedule<S: StateContainer<Tx>>(
         &mut self,
         container: &mut S,
         pre_graph_filter: impl Fn(&[&Tx], &mut [bool]),
@@ -192,16 +195,18 @@ impl<Tx: TransactionWithMeta> PrioGraphScheduler<Tx> {
         let mut unblock_this_batch = Vec::with_capacity(
             self.consume_work_senders.len() * self.config.target_transactions_per_batch,
         );
+        let mut num_scanned: usize = 0;
         let mut num_scheduled: usize = 0;
         let mut num_sent: usize = 0;
         let mut num_unschedulable: usize = 0;
-        while num_scheduled < self.config.max_transactions_per_scheduling_pass {
+        while num_scanned < self.config.max_scanned_transactions_per_scheduling_pass {
             // If nothing is in the main-queue of the `PrioGraph` then there's nothing left to schedule.
             if self.prio_graph.is_empty() {
                 break;
             }
 
             while let Some(id) = self.prio_graph.pop() {
+                num_scanned += 1;
                 unblock_this_batch.push(id);
 
                 // Should always be in the container, during initial testing phase panic.
@@ -231,7 +236,8 @@ impl<Tx: TransactionWithMeta> PrioGraphScheduler<Tx> {
                     Err(TransactionSchedulingError::Filtered) => {
                         container.remove_by_id(id.id);
                     }
-                    Err(TransactionSchedulingError::UnschedulableConflicts) => {
+                    Err(TransactionSchedulingError::UnschedulableConflicts)
+                    | Err(TransactionSchedulingError::UnschedulableThread) => {
                         unschedulable_ids.push(id);
                         saturating_add_assign!(num_unschedulable, 1);
                     }
@@ -267,11 +273,11 @@ impl<Tx: TransactionWithMeta> PrioGraphScheduler<Tx> {
                                 break;
                             }
                         }
-
-                        if num_scheduled >= self.config.max_transactions_per_scheduling_pass {
-                            break;
-                        }
                     }
+                }
+
+                if num_scanned >= self.config.max_scanned_transactions_per_scheduling_pass {
+                    break;
                 }
             }
 
@@ -292,14 +298,13 @@ impl<Tx: TransactionWithMeta> PrioGraphScheduler<Tx> {
         saturating_add_assign!(num_sent, self.send_batches(&mut batches)?);
 
         // Push unschedulable ids back into the container
-        for id in unschedulable_ids {
-            container.push_id_into_queue(id);
-        }
+        container.push_ids_into_queue(unschedulable_ids.into_iter());
 
         // Push remaining transactions back into the container
-        while let Some((id, _)) = self.prio_graph.pop_and_unblock() {
-            container.push_id_into_queue(id);
-        }
+        container.push_ids_into_queue(std::iter::from_fn(|| {
+            self.prio_graph.pop_and_unblock().map(|(id, _)| id)
+        }));
+
         // No more remaining items in the queue.
         // Clear here to make sure the next scheduling pass starts fresh
         // without detecting any conflicts.
@@ -320,7 +325,7 @@ impl<Tx: TransactionWithMeta> PrioGraphScheduler<Tx> {
 
     /// Receive completed batches of transactions without blocking.
     /// Returns (num_transactions, num_retryable_transactions) on success.
-    pub fn receive_completed(
+    fn receive_completed(
         &mut self,
         container: &mut impl StateContainer<Tx>,
     ) -> Result<(usize, usize), SchedulerError> {
@@ -336,7 +341,9 @@ impl<Tx: TransactionWithMeta> PrioGraphScheduler<Tx> {
         }
         Ok((total_num_transactions, total_num_retryable))
     }
+}
 
+impl<Tx: TransactionWithMeta> PrioGraphScheduler<Tx> {
     /// Receive completed batches of transactions.
     /// Returns `Ok((num_transactions, num_retryable))` if a batch was received, `Ok((0, 0))` if no batch was received.
     fn try_receive_completed(
@@ -458,7 +465,7 @@ impl<Tx: TransactionWithMeta> PrioGraphScheduler<Tx> {
     ///
     /// Panics if the `thread_set` is empty. This should never happen, see comment
     /// on `ThreadAwareAccountLocks::try_lock_accounts`.
-    fn select_thread(
+    pub(crate) fn select_thread(
         thread_set: ThreadSet,
         batch_cus_per_thread: &[u64],
         in_flight_cus_per_thread: &[u64],
@@ -498,28 +505,15 @@ impl<Tx: TransactionWithMeta> PrioGraphScheduler<Tx> {
     }
 }
 
-/// Metrics from scheduling transactions.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct SchedulingSummary {
-    /// Number of transactions scheduled.
-    pub num_scheduled: usize,
-    /// Number of transactions that were not scheduled due to conflicts.
-    pub num_unschedulable: usize,
-    /// Number of transactions that were dropped due to filter.
-    pub num_filtered_out: usize,
-    /// Time spent filtering transactions
-    pub filter_time_us: u64,
-}
-
-struct Batches<Tx> {
-    ids: Vec<Vec<TransactionId>>,
-    transactions: Vec<Vec<Tx>>,
-    max_ages: Vec<Vec<MaxAge>>,
-    total_cus: Vec<u64>,
+pub(crate) struct Batches<Tx> {
+    pub ids: Vec<Vec<TransactionId>>,
+    pub transactions: Vec<Vec<Tx>>,
+    pub max_ages: Vec<Vec<MaxAge>>,
+    pub total_cus: Vec<u64>,
 }
 
 impl<Tx> Batches<Tx> {
-    fn new(num_threads: usize, target_num_transactions_per_batch: usize) -> Self {
+    pub(crate) fn new(num_threads: usize, target_num_transactions_per_batch: usize) -> Self {
         Self {
             ids: vec![Vec::with_capacity(target_num_transactions_per_batch); num_threads],
 
@@ -531,7 +525,7 @@ impl<Tx> Batches<Tx> {
         }
     }
 
-    fn take_batch(
+    pub(crate) fn take_batch(
         &mut self,
         thread_id: ThreadId,
         target_num_transactions_per_batch: usize,
@@ -555,20 +549,22 @@ impl<Tx> Batches<Tx> {
 }
 
 /// A transaction has been scheduled to a thread.
-struct TransactionSchedulingInfo<Tx> {
-    thread_id: ThreadId,
-    transaction: Tx,
-    max_age: MaxAge,
-    cost: u64,
+pub(crate) struct TransactionSchedulingInfo<Tx> {
+    pub thread_id: ThreadId,
+    pub transaction: Tx,
+    pub max_age: MaxAge,
+    pub cost: u64,
 }
 
 /// Error type for reasons a transaction could not be scheduled.
-enum TransactionSchedulingError {
+pub(crate) enum TransactionSchedulingError {
     /// Transaction was filtered out before locking.
     Filtered,
     /// Transaction cannot be scheduled due to conflicts, or
     /// higher priority conflicting transactions are unschedulable.
     UnschedulableConflicts,
+    /// Thread is not allowed to be scheduled on at this time.
+    UnschedulableThread,
 }
 
 fn try_schedule_transaction<Tx: TransactionWithMeta>(
@@ -601,14 +597,21 @@ fn try_schedule_transaction<Tx: TransactionWithMeta>(
         .enumerate()
         .filter_map(|(index, key)| (!transaction.is_writable(index)).then_some(key));
 
-    let Some(thread_id) = account_locks.try_lock_accounts(
+    let thread_id = match account_locks.try_lock_accounts(
         write_account_locks,
         read_account_locks,
         ThreadSet::any(num_threads),
         thread_selector,
-    ) else {
-        blocking_locks.take_locks(transaction);
-        return Err(TransactionSchedulingError::UnschedulableConflicts);
+    ) {
+        Ok(thread_id) => thread_id,
+        Err(TryLockError::MultipleConflicts) => {
+            blocking_locks.take_locks(transaction);
+            return Err(TransactionSchedulingError::UnschedulableConflicts);
+        }
+        Err(TryLockError::ThreadNotAllowed) => {
+            blocking_locks.take_locks(transaction);
+            return Err(TransactionSchedulingError::UnschedulableThread);
+        }
     };
 
     let sanitized_transaction_ttl = transaction_state.transition_to_pending();
@@ -700,7 +703,21 @@ mod tests {
             ),
         >,
     ) -> TransactionStateContainer<RuntimeTransaction<SanitizedTransaction>> {
-        let mut container = TransactionStateContainer::with_capacity(10 * 1024);
+        create_container_with_capacity(100 * 1024, tx_infos)
+    }
+
+    fn create_container_with_capacity(
+        capacity: usize,
+        tx_infos: impl IntoIterator<
+            Item = (
+                impl Borrow<Keypair>,
+                impl IntoIterator<Item = impl Borrow<Pubkey>>,
+                u64,
+                u64,
+            ),
+        >,
+    ) -> TransactionStateContainer<RuntimeTransaction<SanitizedTransaction>> {
+        let mut container = TransactionStateContainer::with_capacity(capacity);
         for (from_keypair, to_pubkeys, lamports, compute_unit_price) in tx_infos.into_iter() {
             let transaction = prioritized_tranfers(
                 from_keypair.borrow(),
@@ -927,5 +944,44 @@ mod tests {
         assert_eq!(scheduling_summary.num_scheduled, 2);
         assert_eq!(scheduling_summary.num_unschedulable, 0);
         assert_eq!(collect_work(&work_receivers[0]).1, vec![vec![2], vec![0]]);
+    }
+
+    #[test]
+    fn test_schedule_over_full_container() {
+        let (mut scheduler, _work_receivers, _finished_work_sender) = create_test_frame(1);
+
+        // set up a container is larger enough that single pass of schedulling will not deplete it.
+        let capacity = scheduler
+            .config
+            .max_scanned_transactions_per_scheduling_pass
+            + 2;
+        let txs = (0..capacity)
+            .map(|_| (Keypair::new(), [Pubkey::new_unique()], 1, 1))
+            .collect_vec();
+        let mut container = create_container_with_capacity(capacity, txs);
+
+        let scheduling_summary = scheduler
+            .schedule(&mut container, test_pre_graph_filter, test_pre_lock_filter)
+            .unwrap();
+        // for each pass, it'd schedule no more than configured max_scanned_transactions_per_scheduling_pass
+        let expected_num_scheduled = std::cmp::min(
+            capacity,
+            scheduler
+                .config
+                .max_scanned_transactions_per_scheduling_pass,
+        );
+        assert_eq!(scheduling_summary.num_scheduled, expected_num_scheduled);
+        assert_eq!(scheduling_summary.num_unschedulable, 0);
+
+        let mut post_schedule_remaining_ids = 0;
+        while let Some(_p) = container.pop() {
+            post_schedule_remaining_ids += 1;
+        }
+
+        // unscheduled ids should remain in the container
+        assert_eq!(
+            post_schedule_remaining_ids,
+            capacity - expected_num_scheduled
+        );
     }
 }

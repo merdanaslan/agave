@@ -11,6 +11,7 @@ use {
         sync::{Arc, RwLock},
         thread, Runner,
     },
+    solana_compute_budget::compute_budget_limits::ComputeBudgetLimits,
     solana_program_runtime::loaded_programs::ProgramCacheEntryType,
     solana_sdk::{
         account::{AccountSharedData, ReadableAccount, WritableAccount},
@@ -144,7 +145,7 @@ fn svm_concurrent() {
 
     mock_bank.configure_sysvars();
     batch_processor.fill_missing_sysvar_cache_entries(&*mock_bank);
-    register_builtins(&mock_bank, &batch_processor);
+    register_builtins(&mock_bank, &batch_processor, false);
 
     let mut transaction_builder = SanitizedTransactionBuilder::default();
     let program_id = deploy_program("transfer-from-account".to_string(), 0, &mock_bank);
@@ -239,10 +240,11 @@ fn svm_concurrent() {
             let local_bank = mock_bank.clone();
             let th_txs = std::mem::take(&mut transactions[idx]);
             let check_results = vec![
-                Ok(CheckedTransactionDetails {
-                    nonce: None,
-                    lamports_per_signature: 20
-                }) as TransactionCheckResult;
+                Ok(CheckedTransactionDetails::new(
+                    None,
+                    20,
+                    Ok(ComputeBudgetLimits::default())
+                )) as TransactionCheckResult;
                 TRANSACTIONS_PER_THREAD
             ];
             let processing_config = TransactionProcessingConfig {

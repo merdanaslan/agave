@@ -8,7 +8,7 @@ use {
     serde::ser::{Impossible, SerializeSeq, SerializeStruct, Serializer},
     serde_derive::{Deserialize, Serialize},
     solana_account_decoder::{encode_ui_account, UiAccountData, UiAccountEncoding},
-    solana_accounts_db::accounts_index::ScanConfig,
+    solana_accounts_db::accounts_index::{ScanConfig, ScanOrder},
     solana_cli_output::{
         display::writeln_transaction, CliAccount, CliAccountNewConfig, OutputFormat, QuietDisplay,
         VerboseDisplay,
@@ -16,7 +16,7 @@ use {
     solana_ledger::{
         blockstore::{Blockstore, BlockstoreError},
         blockstore_meta::{DuplicateSlotProof, ErasureMeta},
-        shred::{Shred, ShredType},
+        shred::{self, Shred, ShredType},
     },
     solana_runtime::bank::{Bank, TotalAccountsStats},
     solana_sdk::{
@@ -408,7 +408,7 @@ impl From<Shred> for CliDuplicateShred {
             merkle_root: shred.merkle_root().ok(),
             chained_merkle_root: shred.chained_merkle_root().ok(),
             last_in_slot: shred.last_in_slot(),
-            payload: shred.payload().clone(),
+            payload: shred::Payload::unwrap_or_clone(shred.payload().clone()),
         }
     }
 }
@@ -586,7 +586,11 @@ pub fn output_slot(
         Err(_) => {
             // Transaction metadata could be missing, try to fetch just the
             // entries and leave the metadata fields empty
-            let entries = blockstore.get_slot_entries(slot, /*shred_start_index:*/ 0)?;
+            let (entries, _, _) = blockstore.get_slot_entries_with_shred_info(
+                slot,
+                /*shred_start_index:*/ 0,
+                allow_dead_slots,
+            )?;
 
             let blockhash = entries
                 .last()
@@ -906,7 +910,7 @@ impl AccountsScanner {
             }),
             AccountsOutputMode::Program(program_pubkey) => self
                 .bank
-                .get_program_accounts(program_pubkey, &ScanConfig::new(false))
+                .get_program_accounts(program_pubkey, &ScanConfig::new(ScanOrder::Sorted))
                 .unwrap()
                 .iter()
                 .filter(|(_, account)| self.should_process_account(account))

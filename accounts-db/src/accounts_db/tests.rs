@@ -16,11 +16,12 @@ use {
     assert_matches::assert_matches,
     itertools::Itertools,
     rand::{prelude::SliceRandom, thread_rng, Rng},
-    solana_sdk::{
-        account::{accounts_equal, Account, AccountSharedData, ReadableAccount, WritableAccount},
-        hash::HASH_BYTES,
-        pubkey::PUBKEY_BYTES,
+    solana_account::{
+        accounts_equal, Account, AccountSharedData, InheritableAccountFields, ReadableAccount,
+        WritableAccount, DUMMY_INHERITABLE_ACCOUNT_FIELDS,
     },
+    solana_hash::HASH_BYTES,
+    solana_pubkey::PUBKEY_BYTES,
     std::{
         hash::DefaultHasher,
         iter::{self, FromIterator},
@@ -77,6 +78,23 @@ where
             false
         }
     }
+}
+
+fn create_loadable_account_with_fields(
+    name: &str,
+    (lamports, rent_epoch): InheritableAccountFields,
+) -> AccountSharedData {
+    AccountSharedData::from(Account {
+        lamports,
+        owner: solana_sdk_ids::native_loader::id(),
+        data: name.as_bytes().to_vec(),
+        executable: true,
+        rent_epoch,
+    })
+}
+
+fn create_loadable_account_for_test(name: &str) -> AccountSharedData {
+    create_loadable_account_with_fields(name, DUMMY_INHERITABLE_ACCOUNT_FIELDS)
 }
 
 impl AccountStorageEntry {
@@ -2458,7 +2476,7 @@ fn test_verify_bank_capitalization() {
             some_slot,
             &[(
                 &native_account_pubkey,
-                &solana_sdk::native_loader::create_loadable_account_for_test("foo"),
+                &create_loadable_account_for_test("foo"),
             )],
         );
         db.add_root_and_flush_write_cache(some_slot);
@@ -3279,15 +3297,14 @@ fn test_delete_dependencies() {
 
 #[test]
 fn test_account_balance_for_capitalization_sysvar() {
-    let normal_sysvar = solana_sdk::account::create_account_for_test(
-        &solana_sdk::slot_history::SlotHistory::default(),
-    );
+    let normal_sysvar =
+        solana_account::create_account_for_test(&solana_slot_history::SlotHistory::default());
     assert_eq!(normal_sysvar.lamports(), 1);
 }
 
 #[test]
 fn test_account_balance_for_capitalization_native_program() {
-    let normal_native_program = solana_sdk::native_loader::create_loadable_account_for_test("foo");
+    let normal_native_program = create_loadable_account_for_test("foo");
     assert_eq!(normal_native_program.lamports(), 1);
 }
 
@@ -3755,6 +3772,11 @@ fn test_account_matches_owners() {
     db.add_root(2);
     db.add_root(3);
 
+    // Set the latest full snapshot slot to one that is *older* than the slot account4 is in.
+    // This is required to ensure account4 is not purged during `clean`,
+    // which is required to have account_matches_owners() return NoMatch.
+    db.set_latest_full_snapshot_slot(2);
+
     // Flush the cache so that the account meta will be read from the storage
     db.flush_accounts_cache(true, None);
     db.clean_accounts_for_tests();
@@ -3940,6 +3962,28 @@ fn test_flush_cache_dont_clean_zero_lamport_account() {
         .lamports(),
         0
     );
+}
+
+/// Ensure that rooting a slot and flushing it in the write cache populates `uncleaned_pubkeys`,
+/// and then that `clean` removes the slot afterwards.
+#[test]
+fn test_flush_cache_populates_uncleaned_pubkeys() {
+    let accounts_db = AccountsDb::new_single_for_tests();
+    let slot = 123;
+    let pubkey = Pubkey::new_unique();
+    let account = AccountSharedData::new(10, 0, &Pubkey::default());
+
+    // storing accounts doesn't add anything to uncleaned_pubkeys
+    accounts_db.store_cached((slot, [(pubkey, account)].as_slice()), None);
+    assert_eq!(accounts_db.get_len_of_slots_with_uncleaned_pubkeys(), 0);
+
+    // ...but ensure that rooting and flushing the write cache does
+    accounts_db.add_root_and_flush_write_cache(slot);
+    assert_eq!(accounts_db.get_len_of_slots_with_uncleaned_pubkeys(), 1);
+
+    // ...and then clean removes the slot from uncleaned_pubkeys
+    accounts_db.clean_accounts_for_tests();
+    assert_eq!(accounts_db.get_len_of_slots_with_uncleaned_pubkeys(), 0);
 }
 
 struct ScanTracker {
@@ -4844,8 +4888,6 @@ define_accounts_db_test!(test_partial_clean, |db| {
     // Store accounts into slots 0 and 1
     db.store_uncached(0, &[(&account_key1, &account1), (&account_key2, &account1)]);
     db.store_uncached(1, &[(&account_key1, &account2)]);
-    db.calculate_accounts_delta_hash(0);
-    db.calculate_accounts_delta_hash(1);
     db.print_accounts_stats("pre-clean1");
 
     // clean accounts - no accounts should be cleaned, since no rooted slots
@@ -4865,7 +4907,6 @@ define_accounts_db_test!(test_partial_clean, |db| {
 
     // store into slot 2
     db.store_uncached(2, &[(&account_key2, &account3), (&account_key1, &account3)]);
-    db.calculate_accounts_delta_hash(2);
     db.clean_accounts_for_tests();
     db.print_accounts_stats("post-clean2");
 
@@ -4876,7 +4917,6 @@ define_accounts_db_test!(test_partial_clean, |db| {
     db.print_accounts_stats("post-clean3");
 
     db.store_uncached(3, &[(&account_key2, &account4)]);
-    db.calculate_accounts_delta_hash(3);
     db.add_root_and_flush_write_cache(3);
 
     // Check that we can clean where max_root=3 and slot=2 is not rooted
@@ -8107,7 +8147,8 @@ fn test_clean_old_storages_with_reclaims_rooted() {
             &[(&pubkey, &account), (&Pubkey::new_unique(), &account)],
         );
         accounts_db.add_root_and_flush_write_cache(slot);
-        // ensure this slot is *not* in the dirty_stores or uncleaned_pubkeys, because we want to
+        accounts_db.uncleaned_pubkeys.remove(&slot);
+        // ensure this slot is *not* in the dirty_stores nor uncleaned_pubkeys, because we want to
         // test cleaning *old* storages, i.e. when they aren't explicitly marked for cleaning
         assert!(!accounts_db.dirty_stores.contains_key(&slot));
         assert!(!accounts_db.uncleaned_pubkeys.contains_key(&slot));
@@ -8165,16 +8206,19 @@ fn test_clean_old_storages_with_reclaims_unrooted() {
             slot,
             &[(&pubkey, &account), (&Pubkey::new_unique(), &account)],
         );
-        accounts_db.calculate_accounts_delta_hash(slot);
-        // ensure this slot is in uncleaned_pubkeys (but not dirty_stores) so it'll be cleaned
-        assert!(!accounts_db.dirty_stores.contains_key(&slot));
-        assert!(accounts_db.uncleaned_pubkeys.contains_key(&slot));
     }
 
     // only `old_slot` should be rooted, not `new_slot`
     accounts_db.add_root_and_flush_write_cache(old_slot);
     assert!(accounts_db.accounts_index.is_alive_root(old_slot));
     assert!(!accounts_db.accounts_index.is_alive_root(new_slot));
+
+    // ensure `old_slot` is in uncleaned_pubkeys (but not dirty_stores) so it'll be cleaned
+    assert!(accounts_db.uncleaned_pubkeys.contains_key(&old_slot));
+    assert!(!accounts_db.dirty_stores.contains_key(&old_slot));
+    // and `new_slot` should be in neither
+    assert!(!accounts_db.uncleaned_pubkeys.contains_key(&new_slot));
+    assert!(!accounts_db.dirty_stores.contains_key(&new_slot));
 
     // ensure the slot list for `pubkey` has both the old and new slots
     let slot_list = accounts_db

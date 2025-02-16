@@ -21,9 +21,7 @@ solana-account = { workspace = true }
 solana-bpf-loader-program = { workspace = true }
 solana-clock = { workspace = true }
 solana-compute-budget = { workspace = true }
-solana-compute-budget-instruction = { workspace = true }
 solana-feature-set = { workspace = true }
-solana-fee = { workspace = true }
 solana-fee-structure = { workspace = true }
 solana-frozen-abi = { workspace = true, optional = true, features = [
     "frozen-abi",
@@ -39,8 +37,9 @@ solana-log-collector = { workspace = true }
 solana-measure = { workspace = true }
 solana-message = { workspace = true }
 solana-nonce = { workspace = true }
+solana-nonce-account = { workspace = true }
 solana-precompiles = { workspace = true }
-solana-program = { workspace = true, default-features = false }
+solana-program = { workspace = true }
 solana-program-runtime = { workspace = true, features = ["metrics"] }
 solana-pubkey = { workspace = true }
 solana-rent = { workspace = true }
@@ -49,7 +48,6 @@ solana-sdk = { workspace = true }
 solana-sdk-ids = { workspace = true }
 solana-svm-rent-collector = { workspace = true }
 solana-svm-transaction = { workspace = true }
-solana-system-program = { workspace = true }
 solana-timings = { workspace = true }
 solana-transaction-context = { workspace = true }
 solana-transaction-error = { workspace = true }
@@ -72,6 +70,7 @@ rand0-7 = { workspace = true }
 shuttle = { workspace = true }
 solana-clock = { workspace = true }
 solana-compute-budget = { workspace = true, features = ["dev-context-only-utils"] }
+solana-compute-budget-instruction = { workspace = true }
 solana-compute-budget-interface = { workspace = true }
 solana-compute-budget-program = { workspace = true }
 solana-ed25519-program = { workspace = true }
@@ -90,8 +89,9 @@ solana-secp256r1-program = { workspace = true, features = ["openssl-vendored"] }
 solana-signature = { workspace = true }
 solana-signer = { workspace = true }
 # See order-crates-for-publishing.py for using this unusual `path = "."`
-solana-svm = { path = ".", features = ["dev-context-only-utils"] }
+solana-svm = { path = ".", features = ["dev-context-only-utils", "svm-internal"] }
 solana-svm-conformance = { workspace = true }
+solana-system-program = { workspace = true }
 solana-system-transaction = { workspace = true }
 solana-sysvar = { workspace = true }
 solana-transaction = { workspace = true }
@@ -115,6 +115,7 @@ shuttle-test = [
     "solana-bpf-loader-program/shuttle-test",
     "solana-loader-v4-program/shuttle-test",
 ]
+svm-internal = []
 
 [lints]
 workspace = true

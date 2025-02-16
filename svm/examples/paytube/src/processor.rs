@@ -2,7 +2,9 @@
 
 use {
     solana_bpf_loader_program::syscalls::create_program_runtime_environment_v1,
-    solana_compute_budget::compute_budget::ComputeBudget,
+    solana_compute_budget::{
+        compute_budget::ComputeBudget, compute_budget_limits::ComputeBudgetLimits,
+    },
     solana_program_runtime::loaded_programs::{BlockRelation, ForkGraph, ProgramCacheEntry},
     solana_sdk::{clock::Slot, feature_set::FeatureSet, transaction},
     solana_svm::{
@@ -93,10 +95,11 @@ pub(crate) fn get_transaction_check_results(
     lamports_per_signature: u64,
 ) -> Vec<transaction::Result<CheckedTransactionDetails>> {
     vec![
-        transaction::Result::Ok(CheckedTransactionDetails {
-            nonce: None,
+        transaction::Result::Ok(CheckedTransactionDetails::new(
+            None,
             lamports_per_signature,
-        });
+            Ok(ComputeBudgetLimits::default())
+        ));
         len
     ]
 }

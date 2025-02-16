@@ -10,8 +10,11 @@ use {
         sorted_storages::SortedStorages,
     },
     rayon::prelude::*,
+    solana_account::ReadableAccount as _,
+    solana_clock::Slot,
+    solana_hash::Hash,
     solana_measure::{measure::Measure, measure_us},
-    solana_sdk::{account::ReadableAccount as _, clock::Slot, hash::Hash, pubkey::Pubkey},
+    solana_pubkey::Pubkey,
     std::{
         hash::{DefaultHasher, Hash as _, Hasher as _},
         ops::Range,
@@ -376,7 +379,7 @@ mod tests {
             append_vec::AppendVec,
             cache_hash_data::{CacheHashDataFile, DeletionPolicy as CacheHashDeletionPolicy},
         },
-        solana_sdk::account::AccountSharedData,
+        solana_account::AccountSharedData,
         tempfile::TempDir,
         test_case::test_case,
     };

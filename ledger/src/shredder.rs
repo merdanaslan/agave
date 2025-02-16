@@ -17,7 +17,7 @@ use {
     std::{
         borrow::Borrow,
         fmt::Debug,
-        sync::{Arc, RwLock},
+        sync::{Arc, OnceLock, RwLock},
     },
 };
 
@@ -38,8 +38,15 @@ pub(crate) const ERASURE_BATCH_SIZE: [usize; 33] = [
     55, 56, 58, 59, 60, 62, 63, 64, // 32
 ];
 
+// Arc<...> wrapper so that cache entries can be initialized without locking
+// the entire cache.
+type LruCacheOnce<K, V> = RwLock<LruCache<K, Arc<OnceLock<V>>>>;
+
 pub struct ReedSolomonCache(
-    RwLock<LruCache<(/*data_shards:*/ usize, /*parity_shards:*/ usize), Arc<ReedSolomon>>>,
+    LruCacheOnce<
+        (usize, usize), // number of {data,parity} shards
+        Result<Arc<ReedSolomon>, reed_solomon_erasure::Error>,
+    >,
 );
 
 #[derive(Debug)]
@@ -70,6 +77,37 @@ impl Shredder {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn make_merkle_shreds_from_entries(
+        &self,
+        keypair: &Keypair,
+        entries: &[Entry],
+        is_last_in_slot: bool,
+        chained_merkle_root: Option<Hash>,
+        next_shred_index: u32,
+        next_code_index: u32,
+        reed_solomon_cache: &ReedSolomonCache,
+        stats: &mut ProcessShredsStats,
+    ) -> impl Iterator<Item = Shred> {
+        shred::make_merkle_shreds_from_entries(
+            &PAR_THREAD_POOL,
+            keypair,
+            entries,
+            self.slot,
+            self.parent_slot,
+            self.version,
+            self.reference_tick,
+            is_last_in_slot,
+            chained_merkle_root,
+            next_shred_index,
+            next_code_index,
+            reed_solomon_cache,
+            stats,
+        )
+        .unwrap()
+    }
+
+    // For legacy tests and benchmarks.
+    #[allow(clippy::too_many_arguments)]
     pub fn entries_to_shreds(
         &self,
         keypair: &Keypair,
@@ -86,24 +124,18 @@ impl Shredder {
         Vec<Shred>, // coding shreds
     ) {
         if merkle_variant {
-            return shred::make_merkle_shreds_from_entries(
-                &PAR_THREAD_POOL,
-                keypair,
-                entries,
-                self.slot,
-                self.parent_slot,
-                self.version,
-                self.reference_tick,
-                is_last_in_slot,
-                chained_merkle_root,
-                next_shred_index,
-                next_code_index,
-                reed_solomon_cache,
-                stats,
-            )
-            .unwrap()
-            .into_iter()
-            .partition(Shred::is_data);
+            return self
+                .make_merkle_shreds_from_entries(
+                    keypair,
+                    entries,
+                    is_last_in_slot,
+                    chained_merkle_root,
+                    next_shred_index,
+                    next_code_index,
+                    reed_solomon_cache,
+                    stats,
+                )
+                .partition(Shred::is_data);
         }
         let data_shreds =
             self.entries_to_data_shreds(keypair, entries, is_last_in_slot, next_shred_index, stats);
@@ -297,7 +329,7 @@ impl Shredder {
         let data: Vec<_> = data
             .iter()
             .map(Borrow::borrow)
-            .map(Shred::erasure_shard_as_slice)
+            .map(Shred::erasure_shard)
             .collect::<Result<_, _>>()
             .unwrap();
         let mut parity = vec![vec![0u8; data[0].len()]; num_coding];
@@ -365,7 +397,7 @@ impl Shredder {
                 Ok(index) if index < fec_set_size => index,
                 _ => return Err(Error::from(InvalidIndex)),
             };
-            shards[index] = Some(shred.erasure_shard()?);
+            shards[index] = Some(shred.erasure_shard()?.to_vec());
             if index < num_data_shreds {
                 mask[index] = true;
             }
@@ -391,18 +423,39 @@ impl Shredder {
     }
 
     /// Combines all shreds to recreate the original buffer
-    pub fn deshred(shreds: &[Shred]) -> Result<Vec<u8>, Error> {
-        let index = shreds.first().ok_or(TooFewDataShards)?.index();
-        let aligned = shreds.iter().zip(index..).all(|(s, i)| s.index() == i);
-        let data_complete = {
-            let shred = shreds.last().unwrap();
-            shred.data_complete() || shred.last_in_slot()
-        };
-        if !data_complete || !aligned {
+    pub fn deshred<I, T: AsRef<[u8]>>(shreds: I) -> Result<Vec<u8>, Error>
+    where
+        I: IntoIterator<Item = T>,
+    {
+        let (data, _, data_complete) = shreds.into_iter().try_fold(
+            <(Vec<u8>, Option<u32>, bool)>::default(),
+            |(mut data, prev, data_complete), shred| {
+                // No trailing shreds if we have already observed
+                // DATA_COMPLETE_SHRED.
+                if data_complete {
+                    return Err(Error::InvalidDeshredSet);
+                }
+                let shred = shred.as_ref();
+                // Shreds' indices should be consecutive.
+                let index = Some(
+                    shred::layout::get_index(shred)
+                        .ok_or_else(|| Error::InvalidPayloadSize(shred.len()))?,
+                );
+                if let Some(prev) = prev {
+                    if prev.checked_add(1) != index {
+                        return Err(Error::from(TooFewDataShards));
+                    }
+                }
+                data.extend_from_slice(shred::layout::get_data(shred)?);
+                let flags = shred::layout::get_flags(shred)?;
+                let data_complete = flags.contains(ShredFlags::DATA_COMPLETE_SHRED);
+                Ok((data, index, data_complete))
+            },
+        )?;
+        // The last shred should be DATA_COMPLETE_SHRED.
+        if !data_complete {
             return Err(Error::from(TooFewDataShards));
         }
-        let data: Vec<_> = shreds.iter().map(Shred::data).collect::<Result<_, _>>()?;
-        let data: Vec<_> = data.into_iter().flatten().copied().collect();
         if data.is_empty() {
             // For backward compatibility. This is needed when the data shred
             // payload is None, so that deserializing to Vec<Entry> results in
@@ -424,16 +477,21 @@ impl ReedSolomonCache {
         parity_shards: usize,
     ) -> Result<Arc<ReedSolomon>, reed_solomon_erasure::Error> {
         let key = (data_shards, parity_shards);
-        if let Some(entry) = self.0.read().unwrap().get(&key).cloned() {
-            return Ok(entry);
-        }
-        let entry = ReedSolomon::new(data_shards, parity_shards)?;
-        let entry = Arc::new(entry);
-        {
-            let entry = entry.clone();
-            self.0.write().unwrap().put(key, entry);
-        }
-        Ok(entry)
+        // Read from the cache with a shared lock.
+        let entry = self.0.read().unwrap().get(&key).cloned();
+        // Fall back to exclusive lock if there is a cache miss.
+        let entry: Arc<OnceLock<Result<_, _>>> = entry.unwrap_or_else(|| {
+            let mut cache = self.0.write().unwrap();
+            cache.get(&key).cloned().unwrap_or_else(|| {
+                let entry = Arc::<OnceLock<Result<_, _>>>::default();
+                cache.put(key, Arc::clone(&entry));
+                entry
+            })
+        });
+        // Initialize if needed by only a single thread outside locks.
+        entry
+            .get_or_init(|| ReedSolomon::new(data_shards, parity_shards).map(Arc::new))
+            .clone()
     }
 }
 
@@ -602,7 +660,10 @@ mod tests {
         assert_eq!(coding_shred_indexes.len(), num_expected_coding_shreds);
 
         // Test reassembly
-        let deshred_payload = Shredder::deshred(&data_shreds).unwrap();
+        let deshred_payload = {
+            let shreds = data_shreds.iter().map(Shred::payload);
+            Shredder::deshred(shreds).unwrap()
+        };
         let deshred_entries: Vec<Entry> = bincode::deserialize(&deshred_payload).unwrap();
         assert_eq!(entries, deshred_entries);
     }
@@ -905,7 +966,10 @@ mod tests {
         );
         shred_info.insert(3, recovered_shred);
 
-        let result = Shredder::deshred(&shred_info[..num_data_shreds]).unwrap();
+        let result = {
+            let shreds = shred_info[..num_data_shreds].iter().map(Shred::payload);
+            Shredder::deshred(shreds).unwrap()
+        };
         assert!(result.len() >= serialized_entries.len());
         assert_eq!(serialized_entries[..], result[..serialized_entries.len()]);
 
@@ -937,7 +1001,10 @@ mod tests {
             shred_info.insert(i * 2, recovered_shred);
         }
 
-        let result = Shredder::deshred(&shred_info[..num_data_shreds]).unwrap();
+        let result = {
+            let shreds = shred_info[..num_data_shreds].iter().map(Shred::payload);
+            Shredder::deshred(shreds).unwrap()
+        };
         assert!(result.len() >= serialized_entries.len());
         assert_eq!(serialized_entries[..], result[..serialized_entries.len()]);
 
@@ -958,7 +1025,7 @@ mod tests {
 
         assert_eq!(shreds.len(), 3);
         assert_matches!(
-            Shredder::deshred(&shreds),
+            Shredder::deshred(shreds.iter().map(Shred::payload)),
             Err(Error::ErasureError(TooFewDataShards))
         );
 
@@ -1011,7 +1078,10 @@ mod tests {
             shred_info.insert(i * 2, recovered_shred);
         }
 
-        let result = Shredder::deshred(&shred_info[..num_data_shreds]).unwrap();
+        let result = {
+            let shreds = shred_info[..num_data_shreds].iter().map(Shred::payload);
+            Shredder::deshred(shreds).unwrap()
+        };
         assert!(result.len() >= serialized_entries.len());
         assert_eq!(serialized_entries[..], result[..serialized_entries.len()]);
 

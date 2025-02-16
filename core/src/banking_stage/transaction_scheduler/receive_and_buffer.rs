@@ -1,13 +1,15 @@
 use {
     super::{
         scheduler_metrics::{SchedulerCountMetrics, SchedulerTimingMetrics},
+        transaction_priority_id::TransactionPriorityId,
         transaction_state::TransactionState,
         transaction_state_container::{
             SharedBytes, StateContainer, TransactionViewState, TransactionViewStateContainer,
+            EXTRA_CAPACITY,
         },
     },
     crate::banking_stage::{
-        decision_maker::BufferedPacketsDecision,
+        consumer::Consumer, decision_maker::BufferedPacketsDecision,
         immutable_deserialized_packet::ImmutableDeserializedPacket,
         packet_deserializer::PacketDeserializer, packet_filter::MAX_ALLOWED_PRECOMPILE_SIGNATURES,
         scheduler_messages::MaxAge,
@@ -80,11 +82,10 @@ impl ReceiveAndBuffer for SanitizedTransactionReceiveAndBuffer {
         count_metrics: &mut SchedulerCountMetrics,
         decision: &BufferedPacketsDecision,
     ) -> Result<usize, ()> {
-        let remaining_queue_capacity = container.remaining_capacity();
-
+        const MAX_RECEIVE_PACKETS: usize = 5_000;
         const MAX_PACKET_RECEIVE_TIME: Duration = Duration::from_millis(10);
         let (recv_timeout, should_buffer) = match decision {
-            BufferedPacketsDecision::Consume(_) => (
+            BufferedPacketsDecision::Consume(_) | BufferedPacketsDecision::Hold => (
                 if container.is_empty() {
                     MAX_PACKET_RECEIVE_TIME
                 } else {
@@ -93,14 +94,12 @@ impl ReceiveAndBuffer for SanitizedTransactionReceiveAndBuffer {
                 true,
             ),
             BufferedPacketsDecision::Forward => (MAX_PACKET_RECEIVE_TIME, self.forwarding_enabled),
-            BufferedPacketsDecision::ForwardAndHold | BufferedPacketsDecision::Hold => {
-                (MAX_PACKET_RECEIVE_TIME, true)
-            }
+            BufferedPacketsDecision::ForwardAndHold => (MAX_PACKET_RECEIVE_TIME, true),
         };
 
         let (received_packet_results, receive_time_us) = measure_us!(self
             .packet_receiver
-            .receive_packets(recv_timeout, remaining_queue_capacity, |packet| {
+            .receive_packets(recv_timeout, MAX_RECEIVE_PACKETS, |packet| {
                 packet.check_excessive_precompiles()?;
                 Ok(packet)
             }));
@@ -247,6 +246,10 @@ impl SanitizedTransactionReceiveAndBuffer {
                     .zip(fee_budget_limits_vec.drain(..))
                     .zip(check_results)
                     .filter(|(_, check_result)| check_result.is_ok())
+                    .filter(|((((_, tx), _), _), _)| {
+                        Consumer::check_fee_payer_unlocked(&working_bank, tx, &mut error_counts)
+                            .is_ok()
+                    })
             {
                 saturating_add_assign!(post_transaction_check_count, 1);
 
@@ -405,8 +408,69 @@ impl TransactionViewReceiveAndBuffer {
 
         let mut num_received = 0usize;
         let mut num_buffered = 0usize;
+        let mut num_dropped_on_status_age_checks = 0usize;
         let mut num_dropped_on_capacity = 0usize;
         let mut num_dropped_on_receive = 0usize;
+
+        // Create temporary batches of transactions to be age-checked.
+        let mut transaction_priority_ids = ArrayVec::<_, EXTRA_CAPACITY>::new();
+        let lock_results: [_; EXTRA_CAPACITY] = core::array::from_fn(|_| Ok(()));
+        let mut error_counters = TransactionErrorMetrics::default();
+
+        let mut check_and_push_to_queue =
+            |container: &mut TransactionViewStateContainer,
+             transaction_priority_ids: &mut ArrayVec<TransactionPriorityId, 64>| {
+                // Temporary scope so that transaction references are immediately
+                // dropped and transactions not passing
+                let mut check_results = {
+                    let mut transactions = ArrayVec::<_, EXTRA_CAPACITY>::new();
+                    transactions.extend(transaction_priority_ids.iter().map(|priority_id| {
+                        &container
+                            .get_transaction_ttl(priority_id.id)
+                            .expect("transaction must exist")
+                            .transaction
+                    }));
+                    working_bank.check_transactions::<RuntimeTransaction<_>>(
+                        &transactions,
+                        &lock_results[..transactions.len()],
+                        MAX_PROCESSING_AGE,
+                        &mut error_counters,
+                    )
+                };
+
+                // Remove errored transactions
+                for (result, priority_id) in check_results
+                    .iter_mut()
+                    .zip(transaction_priority_ids.iter())
+                {
+                    if result.is_err() {
+                        num_dropped_on_status_age_checks += 1;
+                        container.remove_by_id(priority_id.id);
+                    }
+                    let transaction = &container
+                        .get_transaction_ttl(priority_id.id)
+                        .expect("transaction must exist")
+                        .transaction;
+                    if let Err(err) = Consumer::check_fee_payer_unlocked(
+                        working_bank,
+                        transaction,
+                        &mut error_counters,
+                    ) {
+                        *result = Err(err);
+                        num_dropped_on_status_age_checks += 1;
+                        container.remove_by_id(priority_id.id);
+                    }
+                }
+                // Push non-errored transaction into queue.
+                num_dropped_on_capacity += container.push_ids_into_queue(
+                    check_results
+                        .into_iter()
+                        .zip(transaction_priority_ids.drain(..))
+                        .filter(|(r, _)| r.is_ok())
+                        .map(|(_, id)| id),
+                );
+            };
+
         for packet_batch in packet_batch_message.iter() {
             for packet in packet_batch.iter() {
                 let Some(packet_data) = packet.data(..) else {
@@ -416,30 +480,44 @@ impl TransactionViewReceiveAndBuffer {
                 num_received += 1;
 
                 // Reserve free-space to copy packet into, run sanitization checks, and insert.
-                if container.try_insert_with_data(
-                    packet_data,
-                    |bytes| match Self::try_handle_packet(
-                        bytes,
-                        root_bank,
-                        working_bank,
-                        alt_resolved_slot,
-                        sanitized_epoch,
-                        transaction_account_lock_limit,
-                    ) {
-                        Ok(state) => {
-                            num_buffered += 1;
-                            Ok(state)
+                if let Some(transaction_id) =
+                    container.try_insert_map_only_with_data(packet_data, |bytes| {
+                        match Self::try_handle_packet(
+                            bytes,
+                            root_bank,
+                            working_bank,
+                            alt_resolved_slot,
+                            sanitized_epoch,
+                            transaction_account_lock_limit,
+                        ) {
+                            Ok(state) => {
+                                num_buffered += 1;
+                                Ok(state)
+                            }
+                            Err(()) => {
+                                num_dropped_on_receive += 1;
+                                Err(())
+                            }
                         }
-                        Err(()) => {
-                            num_dropped_on_receive += 1;
-                            Err(())
-                        }
-                    },
-                ) {
-                    num_dropped_on_capacity += 1;
-                };
+                    })
+                {
+                    let priority = container
+                        .get_mut_transaction_state(transaction_id)
+                        .expect("transaction must exist")
+                        .priority();
+                    transaction_priority_ids
+                        .push(TransactionPriorityId::new(priority, transaction_id));
+
+                    // If at capacity, run checks and remove invalid transactions.
+                    if transaction_priority_ids.len() == EXTRA_CAPACITY {
+                        check_and_push_to_queue(container, &mut transaction_priority_ids);
+                    }
+                }
             }
         }
+
+        // Any remaining packets undergo status/age checks
+        check_and_push_to_queue(container, &mut transaction_priority_ids);
 
         let buffer_time_us = start.elapsed().as_micros() as u64;
         timing_metrics.update(|timing_metrics| {
@@ -448,6 +526,10 @@ impl TransactionViewReceiveAndBuffer {
         count_metrics.update(|count_metrics| {
             saturating_add_assign!(count_metrics.num_received, num_received);
             saturating_add_assign!(count_metrics.num_buffered, num_buffered);
+            saturating_add_assign!(
+                count_metrics.num_dropped_on_age_and_status,
+                num_dropped_on_status_age_checks
+            );
             saturating_add_assign!(
                 count_metrics.num_dropped_on_capacity,
                 num_dropped_on_capacity
